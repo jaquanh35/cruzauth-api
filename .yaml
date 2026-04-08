@@ -1,0 +1,176 @@
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const fs = require('fs');
+
+const app = express();
+app.use(express.json());
+app.use(helmet());
+
+// 🔒 Rate Limiting
+const limiter = rateLimit({
+windowMs: 15 * 60 * 1000,
+max: 100
+});
+app.use(limiter);
+
+// 🔑 Secret (CHANGE THIS IN REAL PROJECT)
+const JWT_SECRET = "supersecretkey";
+
+// 🧠 In-memory "database" (for now)
+const users = [];
+
+// 📜 Logger
+function logEvent(event) {
+const log = {
+timestamp: new Date().toISOString(),
+...event
+};
+fs.appendFileSync('security.log', JSON.stringify(log) + '\n');
+}
+
+// 🚨 Threat Detection
+const suspiciousIPs = {};
+
+function detectThreat(req, user) {
+const ip = req.ip;
+
+if (!suspiciousIPs[ip]) {
+suspiciousIPs[ip] = 0;
+}
+
+suspiciousIPs[ip]++;
+
+if (suspiciousIPs[ip] > 5) {
+logEvent({
+type: 'THREAT_DETECTED',
+ip
+});
+return true;
+}
+
+if (user && user.lastIP && user.lastIP !== ip) {
+logEvent({
+type: 'SUSPICIOUS_LOGIN',
+oldIP: user.lastIP,
+newIP: ip
+});
+}
+
+return false;
+}
+
+// 🔐 Register
+app.post('/register', async (req, res) => {
+const { email, password } = req.body;
+
+const hashedPassword = await bcrypt.hash(password, 12);
+
+const mfaSecret = speakeasy.generateSecret({ length: 20 });
+
+const user = {
+id: users.length + 1,
+email,
+password: hashedPassword,
+mfaSecret: mfaSecret.base32,
+lastIP: null
+};
+
+users.push(user);
+
+const qrCode = await QRCode.toDataURL(mfaSecret.otpauth_url);
+
+logEvent({
+type: 'REGISTER',
+email,
+ip: req.ip
+});
+
+res.json({
+message: 'User registered',
+mfaQRCode: qrCode
+});
+});
+
+// 🔑 Login (Step 1)
+app.post('/login', async (req, res) => {
+const { email, password } = req.body;
+
+const user = users.find(u => u.email === email);
+
+logEvent({
+type: 'LOGIN_ATTEMPT',
+email,
+ip: req.ip
+});
+
+if (!user) return res.status(400).send('User not found');
+
+if (detectThreat(req, user)) {
+return res.status(403).send('Too many attempts');
+}
+
+const valid = await bcrypt.compare(password, user.password);
+
+if (!valid) return res.status(401).send('Invalid password');
+
+res.json({
+message: 'MFA required',
+userId: user.id
+});
+});
+
+// 🔐 MFA Verify (Step 2)
+app.post('/verify-mfa', (req, res) => {
+const { userId, token } = req.body;
+
+const user = users.find(u => u.id === userId);
+
+const verified = speakeasy.totp.verify({
+secret: user.mfaSecret,
+encoding: 'base32',
+token,
+window: 1
+});
+
+if (!verified) return res.status(401).send('Invalid MFA code');
+
+user.lastIP = req.ip;
+
+const jwtToken = jwt.sign(
+{ id: user.id },
+JWT_SECRET,
+{ expiresIn: '1h' }
+);
+
+logEvent({
+type: 'LOGIN_SUCCESS',
+userId: user.id,
+ip: req.ip
+});
+
+res.json({ token: jwtToken });
+});
+
+// 🛡️ Protected Route
+app.get('/secure', (req, res) => {
+const token = req.headers['authorization'];
+
+if (!token) return res.status(403).send('Access denied');
+
+try {
+const verified = jwt.verify(token, JWT_SECRET);
+res.json({ message: 'Secure data', user: verified });
+} catch {
+res.status(401).send('Invalid token');
+}
+});
+
+// 🚀 Start Server
+app.listen(3000, () => {
+console.log('Cruzauth API running on port 3000');
+});
